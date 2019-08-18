@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading;
 using System.IO;
 using System.Text.RegularExpressions;
 
@@ -17,6 +18,7 @@ namespace SimpleFTP
 
         TcpListener passiveListener_;
         TcpClient passiveClient_;
+        ManualResetEvent passiveAccepted_ = new ManualResetEvent(false);
 
         public DataTransferProcess()
         {
@@ -43,9 +45,10 @@ namespace SimpleFTP
 
                     try
                     {
-                        if(result.IsCompleted && result.CompletedSynchronously)
+                        if(result.IsCompleted /* && result.CompletedSynchronously */)
                         {
                             owner.passiveClient_ = owner.passiveListener_?.EndAcceptTcpClient(result);
+                            owner.passiveAccepted_.Set();
                         }
                     }
                     catch(ObjectDisposedException)
@@ -58,6 +61,8 @@ namespace SimpleFTP
 
         public void StopPassive()
         {
+            this.passiveAccepted_.Reset();
+
             if (this.passiveClient_ != null)
             {
                 this.passiveClient_.Close();
@@ -205,6 +210,8 @@ namespace SimpleFTP
                     {
                         return false;
                     }
+
+                    this.passiveAccepted_.WaitOne(30000);
 
                     if(this.passiveClient_ == null)
                     {
