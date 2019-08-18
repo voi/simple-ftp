@@ -59,6 +59,18 @@ namespace SimpleFTP
                 this.Name = tokens[0].Trim();
                 this.Param = tokens.Length > 1 ? tokens[1].Trim() : String.Empty;
             }
+
+            public string GetOption()
+            {
+                var match = Regex.Match(this.Param, @"(-\w+)*");
+
+                return (match.Success ? match.Value.Trim() : String.Empty);
+            }
+
+            public string GetParam()
+            {
+                return Regex.Replace(this.Param, @"(-\w+)*", "").Trim();
+            }
         }
 
         LoginAccount currentAccount_;
@@ -259,10 +271,6 @@ namespace SimpleFTP
                                 this.DoRMD(command, replyer);
                                 break;
 
-                            case "STAT":    // 現在の状態を取得する。
-                                replyer.Send(ReplyCode._202);
-                                break;
-
                             case "STOR":    // ファイルをアップロード（Stor）する。
                                 this.DoSTOR(command, replyer);
                                 break;
@@ -288,8 +296,9 @@ namespace SimpleFTP
                             case "SITE":    // RFCで定義されていないようなリモートサーバ特有のコマンドを送信する。
                             case "SMNT":    // ファイル構造をマウントする
                             case "STRU":    // 転送するファイルの構造を設定する。
+                            case "STAT":    // 現在の状態を取得する。
                             case "SYST":    // システムの種別を返す。
-                                replyer.Send(ReplyCode._202);
+                                this.OnLogger(replyer.Send(ReplyCode._502));
                                 break;
 
                             default:
@@ -314,31 +323,15 @@ namespace SimpleFTP
 
         private void DoPASV(Command command, Replyer replyer)
         {
-            IPEndPoint ownIP = this.connection_.Client.RemoteEndPoint as IPEndPoint;
-            int[] used_ports = IPGlobalProperties
-                .GetIPGlobalProperties()
-                .GetActiveTcpConnections()
-                .Select((conn) => { return conn.LocalEndPoint.Port; })
-                .ToArray();
-            Random generator = new Random();
-            ushort port = 0;
-
-            do
-            {
-                port = (ushort)generator.Next(50000, 60000);
-            }
-            while (used_ports.Contains(port));
-
-            string host_port = String.Format("{0},{1},{2}",
-                ownIP.Address.ToString().Replace('.', ','),
-                (port >> 8), (port & 0x00FF));
+            string host_port = MakeHostPortPart(
+                this.connection_.Client.LocalEndPoint, FindUnusedPort());
 
             this.currentDTP_.SetPort(host_port);
             this.currentDTP_.IsPassive = true;
             this.currentDTP_.StartPassive();
 
             this.OnLogger(replyer.Send(
-                ReplyCode._227, String.Format("Entering Passive Mode.{0}", host_port)));
+                ReplyCode._227, String.Format("Entering Passive Mode. ({0})", host_port)));
         }
 
         private void DoTYPE(Command command, Replyer replyer)
@@ -370,7 +363,8 @@ namespace SimpleFTP
 
         private void DoLIST(Command command, Replyer replyer)
         {
-            string path = this.currentAccount_.LocalizePath(command.Param);
+            // Ignore LIST option `-al`
+            string path = this.currentAccount_.LocalizePath(command.GetParam());
 
             if(String.IsNullOrEmpty(path))
             {
@@ -383,35 +377,64 @@ namespace SimpleFTP
             string host_name = Dns.GetHostName();
             DateTimeFormatInfo dateTimeFormat = new CultureInfo("en-US", true).DateTimeFormat;
 
+            // [permission]<SP>[?]<SP>[user]<SP>[datetime]<SP>[name]
             foreach (var entry in Directory.GetFileSystemEntries(path))
             {
-                if(Directory.Exists(entry))
+                if (Directory.Exists(entry))
                 {
                     DirectoryInfo info = new DirectoryInfo(entry);
 
-                    nlst.AppendLine(String.Format("dwr-wr-wr-\t0\towner\t{0}\t{1}{2}\t{3}",
+                    nlst.AppendLine(
+                        String.Format("drwxrw-rw-     0 owner {0,15} {1} {2,8} {3}",
                         0,
                         dateTimeFormat.GetAbbreviatedMonthName(info.LastWriteTime.Month),
-                        info.LastWriteTime.ToString(" dd yyyy"),
+                        info.LastWriteTime.ToString("d HH:MM"),
                         info.Name));
                 }
                 else
                 {
                     FileInfo info = new FileInfo(entry);
 
-                    nlst.AppendLine(String.Format("-wr-wr-wr-\t0\towner\t{0}\t{1}{2}\t{3}",
+                    nlst.AppendLine(
+                        String.Format("-rwxrw-rw-     0 owner {0,15} {1} {2,8} {3}",
                         info.Length,
                         dateTimeFormat.GetAbbreviatedMonthName(info.LastWriteTime.Month),
-                        info.LastWriteTime.ToString(" dd yyyy"),
+                        info.LastWriteTime.ToString("d HH:MM"),
                         info.Name));
                 }
             }
+#if MLST
+            // MLST format
+            // [name];[type];[size];[datetime];[user];[permission]
+            foreach (var entry in Directory.GetFileSystemEntries(path))
+            {
+                if (Directory.Exists(entry))
+                {
+                    DirectoryInfo info = new DirectoryInfo(entry);
 
+                    nlst.AppendLine(
+                        String.Format("{0};D;{1};{2};1;\"owner\" [0];\"\" [0];rwxrw-rw-;1",
+                        info.Name, 0,
+                        info.LastWriteTime.ToString("yyyy-MM-ddTHH:MM:ss.fffZ")
+                        ));
+                }
+                else
+                {
+                    FileInfo info = new FileInfo(entry);
+
+                    nlst.AppendLine(
+                        String.Format("{0};-;{1};{2};1;\"owner\" [0];\"\" [0];rwxrw-rw-;1",
+                        info.Name, info.Length,
+                        info.LastWriteTime.ToString("yyyy-MM-ddTHH:MM:ss.fffZ")
+                        ));
+                }
+            }
+#endif
             this.NotifyType(replyer);
 
             if (this.currentDTP_.Send(nlst.ToString()))
             {
-                this.OnLogger(replyer.Send(ReplyCode._250));
+                this.OnLogger(replyer.Send(ReplyCode._226));
             }
             else
             {
@@ -421,7 +444,7 @@ namespace SimpleFTP
 
         private void DoNLST(Command command, Replyer replyer)
         {
-            string path = this.currentAccount_.LocalizePath(command.Param);
+            string path = this.currentAccount_.LocalizePath(command.GetParam());
 
             if (String.IsNullOrEmpty(path))
             {
@@ -658,7 +681,7 @@ namespace SimpleFTP
                 remotePath = "/";
             }
 
-            this.OnLogger(replyer.Send(ReplyCode._257, remotePath));
+            this.OnLogger(replyer.Send(ReplyCode._257, String.Format("\"{0}\" is your directory.", remotePath)));
         }
 
         private void DoPASS(Command command, Replyer replyer)
@@ -705,6 +728,34 @@ namespace SimpleFTP
                     this.OnLogger(replyer.Send(ReplyCode._150, "Open ASCII mode."));
                 }
             }
+        }
+
+        private static string MakeHostPortPart(EndPoint address, ushort port)
+        {
+            IPEndPoint ownIP = address as IPEndPoint;
+
+            return String.Format("{0},{1},{2}",
+                ownIP.Address.ToString().Replace('.', ','),
+                (port >> 8), (port & 0x00FF));
+        }
+
+        private static ushort FindUnusedPort()
+        {
+            int[] used_ports = IPGlobalProperties
+                .GetIPGlobalProperties()
+                .GetActiveTcpConnections()
+                .Select((conn) => { return conn.LocalEndPoint.Port; })
+                .ToArray();
+            Random generator = new Random();
+            ushort port = 0;
+
+            do
+            {
+                port = (ushort)generator.Next(50000, 60000);
+            }
+            while (used_ports.Contains(port));
+
+            return port;
         }
     }
 }
